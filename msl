@@ -1,0 +1,693 @@
+#!/bin/bash
+
+alias VBoxManage='/usr/local/bin/VBoxManage'
+
+PATH=$PATH:/usr/local/bin
+
+VM_NAME=""
+HOST_USER=""
+GUEST_USER=""
+
+USER_SOURCE=shell
+
+rm -f $HOME/msl.log
+
+debug_echo() {
+    echo $@ >> $HOME/msl.log
+}
+
+debug_echo USER: $USER - $(date) - $PATH
+
+UNAME=$(uname)
+if [ "$UNAME" == "Darwin" ]; then
+    DATA_PATH="$HOME"/"Library/msl/"
+else
+    DATA_PATH="$HOME"/".cache/msl/"
+fi
+debug_echo DATA_PATH: $DATA_PATH
+mkdir -p $DATA_PATH
+
+VM_DEFAULT_FILE=$DATA_PATH/vm.default
+HOST_USER_FILE=$DATA_PATH/host_user.default
+GUEST_USER_FILE=$DATA_PATH/guest_user.default
+STARTUP_FILE=$DATA_PATH/startup.conf
+
+check_vm_exists() {
+    debug_echo $(VBoxManage list vms)
+    if VBoxManage list vms | grep -wq "\"$1\""; then
+        echo -n true
+    else
+        echo -n false
+    fi
+}
+
+get_vm_state() {
+    VM_EXISTS=$(check_vm_exists "$1")
+    if [ "$VM_EXISTS" == "false" ]; then
+        echo -n invalid
+    else
+        VM_STATE=$(VBoxManage showvminfo "$1" | grep -i "State:")
+        debug_echo get_vm_state $VM_STATE
+        VM_STATE=${VM_STATE#* }
+        #debug_echo first VM_STATE: $VM_STATE
+        VM_STATE=${VM_STATE%(*}
+        debug_echo get_vm_state VM_STATE: $VM_STATE
+        echo -n $VM_STATE
+    fi
+}
+
+is_vm_running() {
+    VM_STATE=$(get_vm_state "$1")
+    if [ "$VM_STATE" == "running" ]; then
+        echo -n true
+    else
+        echo -n false
+    fi
+}
+
+add_ssh_port() {
+    debug_echo add new port: $2
+    if [ "$2" == "10100" ]; then
+        echo 0
+        return 0
+    fi
+    VM_RUNNING=$(is_vm_running $1)
+    CMD_ARGS="modifyvm \"$1\" --natpf1 \"ssh,tcp,,$2,,22\""
+    if [ "$VM_RUNNING" == "true" ]; then
+        CMD_ARGS="controlvm \"$1\" natpf1 \"ssh,tcp,,$2,,22\""
+    fi
+    debug_echo CMD_ARGS: $CMD_ARGS
+
+    if eval VBoxManage $CMD_ARGS &>/dev/null; then
+        echo -n $2
+    else
+        debug_echo add port $2 failed, try next
+        NEXT_PORT=$(expr $2 + 1)
+        add_ssh_port "$1" $NEXT_PORT
+    fi
+}
+
+get_ssh_port() {
+    debug_echo get_ssh_port: $1
+    if VBoxManage showvminfo "$1" | grep -w "guest port = 22" | grep -qw "name = ssh"; then
+        #debug_echo port found
+        SSH_PORT=$(VBoxManage showvminfo "$1" | grep -w "guest port = 22" | grep -w "name = ssh")
+        debug_echo SSH_PORT: $SSH_PORT
+        SSH_PORT=${SSH_PORT#*,} # remove name
+        #debug_echo SSH_PORT: $SSH_PORT
+        SSH_PORT=${SSH_PORT#*,} # remove protocol
+        #debug_echo SSH_PORT: $SSH_PORT
+        SSH_PORT=${SSH_PORT#*,} # remove host ip
+        #debug_echo SSH_PORT: $SSH_PORT
+        SSH_PORT=${SSH_PORT%,*} # remove guest port
+        #debug_echo SSH_PORT: $SSH_PORT
+        SSH_PORT=${SSH_PORT%,*} # remove guest ip
+        #debug_echo SSH_PORT: $SSH_PORT
+        SSH_PORT=${SSH_PORT:12} #
+        #debug_echo SSH_PORT: $SSH_PORT
+        echo -n $SSH_PORT
+    else
+        debug_echo call add ssh port
+        add_ssh_port "$1" 10000
+    fi
+}
+
+vm_start() {
+    VM_RUNNING=$(is_vm_running $1)
+    if [ "$VM_RUNNING" == "true" ]; then
+        if [ "$2" != "ignore" ]; then
+            echo "$1" is already running
+        fi
+        return 0
+    fi
+    if VBoxManage startvm "$1" --type headless &>/dev/null; then
+        echo Starting instance: "$1"
+        until ssh -o ConnectTimeout=1 $GUEST_USER@localhost -p $SSH_PORT echo Started 2>/dev/null ; do echo -n .; sleep 1; done
+        vm_mount_all
+    fi
+}
+
+vm_stop() {
+    VM_RUNNING=$(is_vm_running $1)
+    if [ "$VM_RUNNING" == "false" ]; then
+        echo "$1" is already stopped
+        return 0
+    fi
+
+    echo Stopping instance: $1
+    VBoxManage controlvm "$1" acpipowerbutton
+
+    while [ $(is_vm_running $1) == true ]; do
+        echo -n .
+        sleep 1
+    done
+    echo ""
+}
+
+vm_shell() {
+    vm_start "$1" ignore
+    if [ "$2" == "" ]; then
+        ssh $GUEST_USER@localhost -p $SSH_PORT
+    else
+        shift
+        ssh $GUEST_USER@localhost -p $SSH_PORT "$@"
+    fi
+}
+
+vm_exec() {
+    vm_shell "$VM_NAME" "$@"
+    exit
+}
+
+add_to_mount_list() {
+    VM_NAME="$1"
+    HOST_PATH="$2"
+    GUEST_PATH="$3"
+
+    MOUNTS_FILE="$DATA_PATH"/"$VM_NAME".mounts
+    MOUNT_LINE="$HOST_PATH":"$GUEST_PATH"
+    if grep -qw "$MOUNT_LINE" "$MOUNTS_FILE" &>/dev/null; then
+        debug_echo mount already listed
+    else
+        debug_echo add to mount list
+        echo "$MOUNT_LINE" >> "$MOUNTS_FILE"
+    fi
+}
+
+vm_mount() {
+    vm_start "$VM_NAME" ignore
+    HOST_PATH="$1"
+    GUEST_PATH=$(ssh -n $GUEST_USER@localhost -p $SSH_PORT echo "$2")
+    echo "Mounting host:$HOST_PATH to guest:$GUEST_PATH"
+    ssh -n $GUEST_USER@localhost -p $SSH_PORT mkdir -p "$GUEST_PATH" &>/dev/null
+    ssh -n $GUEST_USER@localhost -p $SSH_PORT fusermount -u "$GUEST_PATH" &>/dev/null
+    if ssh -n $GUEST_USER@localhost -p $SSH_PORT sshfs -o idmap=user $HOST_USER@10.0.2.2:"$HOST_PATH" "$GUEST_PATH"; then
+        if [ "$3" != "ignore" ]; then
+            add_to_mount_list "$VM_NAME" "$HOST_PATH" "$GUEST_PATH"
+        fi
+        echo Successfully mounted
+    else
+        echo Mount failed
+    fi
+}
+
+vm_mount_all() {
+    MOUNTS_FILE="$DATA_PATH"/"$VM_NAME".mounts
+    if [ -e "$MOUNTS_FILE" ]; then
+        echo -n ""
+    else
+        echo No mount points for this instance.
+        return 0
+    fi
+    while IFS= read -r line
+    do
+        debug_echo "$line"
+        HOST_PATH=${line%:*}
+        GUEST_PATH=${line#*:}
+        debug_echo HOST_PATH: $HOST_PATH : GUEST_PATH: $GUEST_PATH
+        vm_mount "$HOST_PATH" "$GUEST_PATH" ignore
+    done < "$MOUNTS_FILE"
+}
+
+remove_from_mount_list() {
+    VM_NAME="$1"
+    SEARCH_PATH="$2"
+    MOUNTS_FILE="$DATA_PATH"/"$VM_NAME".mounts
+    TEMP_MOUNTS_FILE="$DATA_PATH"/"$VM_NAME".mounts.tmp
+    rm -f "$TEMP_MOUNTS_FILE"
+
+    debug_echo SEARCH_PATH: $SEARCH_PATH
+    while IFS= read -r line
+    do
+        debug_echo "$line"
+        HOST_PATH=${line%:*}
+        GUEST_PATH=${line#*:}
+        debug_echo HOST_PATH: $HOST_PATH : GUEST_PATH: $GUEST_PATH
+        if [ "$SEARCH_PATH" != "$GUEST_PATH" ]; then
+            echo "$line" >> "$TEMP_MOUNTS_FILE"
+        fi
+    done < "$MOUNTS_FILE"
+    rm -f "$MOUNTS_FILE"
+    mv "$TEMP_MOUNTS_FILE" "$MOUNTS_FILE"
+}
+
+vm_umount() {
+    vm_start "$VM_NAME" ignore
+    GUEST_PATH=$(ssh -n $GUEST_USER@localhost -p $SSH_PORT echo "$1")
+    echo "Unmounting guest path: $GUEST_PATH"
+    if ssh -n $GUEST_USER@localhost -p $SSH_PORT fusermount -u "$GUEST_PATH"; then
+        if [ "$2" != "ignore" ]; then
+            remove_from_mount_list "$VM_NAME" "$GUEST_PATH"
+        fi
+        echo Successfully unmounted
+    else
+        echo Unmount failed
+    fi
+}
+
+vm_umount_all() {
+    MOUNTS_FILE="$DATA_PATH"/"$VM_NAME".mounts
+    while IFS= read -r line
+    do
+        debug_echo "$line"
+        HOST_PATH=${line%:*}
+        GUEST_PATH=${line#*:}
+        debug_echo HOST_PATH: $HOST_PATH : GUEST_PATH: $GUEST_PATH
+        vm_umount "$GUEST_PATH" ignore
+    done < "$MOUNTS_FILE"
+    rm -f "$MOUNTS_FILE"
+}
+
+vm_list() {
+    #echo "-----------------------------------"
+    #echo "Instance Name           State"
+    #echo "-----------------------------------"
+    echo "-------------------------------------------"
+    DEFAULT_VM=$(vm_get_default)
+    while read -r line
+    do
+        debug_echo vm_list $line
+        line=${line:1}
+        #debug_echo vm_list $line
+        VM_NAME=${line%\"*}
+        debug_echo vm_list $VM_NAME
+        VM_STATE=$(get_vm_state "$VM_NAME")
+        VM_NAME_DEF=$VM_NAME
+        if [ "$VM_NAME" == "$DEFAULT_VM" ]; then
+            VM_NAME_DEF="$VM_NAME""(default)"
+        fi
+        printf '%s%*s' "$VM_NAME_DEF" "$((24-${#VM_NAME_DEF}))" "";
+        echo "State: "$VM_STATE
+        echo "-------------------------------------------"
+        if [ "$1" == "--long" ]; then
+            echo "Users:"
+            echo "   Host: $(vm_get_host_user --source "$VM_NAME")"
+            echo "   Guest: $(vm_get_guest_user --source "$VM_NAME")"
+            #echo "Mounts:"
+            vm_list_mounts "$VM_NAME"
+        fi
+        echo "-------------------------------------------"
+    done < <(VBoxManage list vms)
+}
+
+vm_list_mounts() {
+    MOUNTS_FILE="$DATA_PATH"/"$VM_NAME".mounts
+    echo "---------------------------"
+    echo "Mounts listed as Host:Guest"
+    echo "---------------------------"
+    cat "$MOUNTS_FILE" 2>/dev/null
+}
+
+OPERATION=""
+
+set_operation() {
+    debug_echo OPERATION: $OPERATION arg: $1
+    if [ "$OPERATION" == "" ]; then
+        OPERATION="$1"
+    else
+        echo $1 & $OPERATION cannot be applied together
+        exit
+    fi
+}
+
+vm_set_default() {
+    if [ "$1" == "" ]; then
+        echo Default VM removed
+        rm -f "$VM_DEFAULT_FILE"
+        exit
+    fi
+    VM_EXISTS=$(check_vm_exists "$1")
+    debug_echo VM_EXISTS: $VM_EXISTS
+
+    if [ "$VM_EXISTS" == "false" ]; then
+        echo "$1": Wrong VM Name
+        exit
+    fi
+    echo -n $1 > "$VM_DEFAULT_FILE"
+}
+
+vm_get_default() {
+    VM_NAME=$(cat "$VM_DEFAULT_FILE" 2>/dev/null)
+    echo -n $VM_NAME
+}
+
+vm_set_host_user() {
+    if [ "$1" == "" ] || [ "$1" == "-d" ]; then
+        echo Default Host User Removed, shell username will be used
+        rm -f "$HOST_USER_FILE"
+        exit
+    fi
+
+    VM_HOST_USER_FILE=$HOST_USER_FILE
+
+    if [ "$2" != "" ]; then
+
+        VM_EXISTS=$(check_vm_exists "$2")
+        debug_echo VM_EXISTS: $VM_EXISTS
+
+        if [ "$VM_EXISTS" == "false" ]; then
+            echo "$2": Wrong VM Name
+            exit
+        else
+            VM_HOST_USER_FILE=$DATA_PATH/$2.host_user.default
+        fi
+        if [ "$1" == "-d" ]; then
+            rm -f "$VM_HOST_USER_FILE"
+            exit
+        fi
+    fi
+
+    echo -n $1 > "$VM_HOST_USER_FILE"
+}
+
+vm_get_host_user() {
+    APPEND_SOURCE=false
+    if [ "$1" == "--source" ]; then
+        shift
+        APPEND_SOURCE=true
+    fi
+    if [ "$1" != "" ]; then
+        VM_HOST_USER_FILE=$DATA_PATH/$1.host_user.default
+        HOST_USER=$(cat "$VM_HOST_USER_FILE" 2>/dev/null)
+        USER_SOURCE="instance"
+    fi
+    if [ "$HOST_USER" == "" ]; then
+        HOST_USER=$(cat "$HOST_USER_FILE" 2>/dev/null)
+        USER_SOURCE="global"
+    fi
+    if [ "$HOST_USER" == "" ]; then
+        HOST_USER=$USER
+        USER_SOURCE="shell"
+    fi
+    debug_echo vm_get_host_user USER_SOURCE: $USER_SOURCE
+    if [ "$APPEND_SOURCE" == "true" ]; then
+        echo -n "$HOST_USER""($USER_SOURCE)"
+    else
+        echo -n $HOST_USER
+    fi
+}
+
+vm_set_guest_user() {
+
+    VM_GUEST_USER_FILE=$GUEST_USER_FILE
+
+    if [ "$2" != "" ]; then
+        VM_EXISTS=$(check_vm_exists "$2")
+        debug_echo VM_EXISTS: $VM_EXISTS
+
+        if [ "$VM_EXISTS" == "false" ]; then
+            echo "$2": Wrong VM Name
+            exit
+        else
+            VM_GUEST_USER_FILE=$DATA_PATH/$2.guest_user.default
+        fi
+        if [ "$1" == "-d" ]; then
+            echo Default Guest User Removed for $2, shell username will be used if global default user not set
+            rm -f "$VM_GUEST_USER_FILE"
+            exit
+        fi
+    fi
+
+    if [ "$1" == "" ] || [ "$1" == "-d" ]; then
+        echo Default Guest User Removed, shell username will be used if instance default user not set
+        rm -f "$GUEST_USER_FILE"
+        exit
+    fi
+
+    echo -n $1 > "$VM_GUEST_USER_FILE"
+}
+
+vm_get_guest_user() {
+    APPEND_SOURCE=false
+    if [ "$1" == "--source" ]; then
+        shift
+        APPEND_SOURCE=true
+    fi
+    if [ "$1" != "" ]; then
+        VM_GUEST_USER_FILE=$DATA_PATH/$1.guest_user.default
+        GUEST_USER=$(cat "$VM_GUEST_USER_FILE" 2>/dev/null)
+        USER_SOURCE="instance"
+    fi
+    if [ "$GUEST_USER" == "" ]; then
+        GUEST_USER=$(cat "$GUEST_USER_FILE" 2>/dev/null)
+        USER_SOURCE="global"
+    fi
+    if [ "$GUEST_USER" == "" ]; then
+        GUEST_USER=$USER
+        USER_SOURCE="shell"
+    fi
+    debug_echo vm_get_guest_user USER_SOURCE: $USER_SOURCE
+    if [ "$APPEND_SOURCE" == "true" ]; then
+        echo -n "$GUEST_USER""($USER_SOURCE)"
+    else
+        echo -n $GUEST_USER
+    fi
+}
+
+check_required_params() {
+    if [ "$VM_NAME" == "" ]; then
+        VM_NAME=$(cat "$VM_DEFAULT_FILE" 2>/dev/null)
+    fi
+
+    debug_echo VM_NAME: $VM_NAME
+
+    if [ "$VM_NAME" == "" ]; then
+        echo Supply VM Name in argument or set default VM
+        exit
+    fi
+
+    VM_EXISTS=$(check_vm_exists "$VM_NAME")
+    debug_echo VM_EXISTS: $VM_EXISTS
+
+    if [ "$VM_EXISTS" == "false" ]; then
+        echo "$VM_NAME": Wrong VM Name
+        exit
+    fi
+
+    if [ "$HOST_USER" == "" ]; then
+        HOST_USER=$(vm_get_host_user "$VM_NAME")
+    fi
+
+    if [ "$GUEST_USER" == "" ]; then
+        GUEST_USER=$(vm_get_guest_user "$VM_NAME")
+    fi
+
+    SSH_PORT=$(get_ssh_port "$VM_NAME")
+    debug_echo GOT SSH_PORT: $SSH_PORT
+
+    if [ "$SSH_PORT" == "0" ]; then
+        echo Couldnot find port to connect to VM
+        exit
+    fi
+}
+
+vm_help() {
+    echo "---------------"
+    echo "Help:"
+    echo "---------------"
+    echo "Global settings:"
+    echo "---------------"
+    echo "  set_default               set/reset default vm"
+    echo "    Instance Name             set default vm with provided instance name"
+    echo "    No Argument               remove the default instance from the settings"
+    echo "  get_default               get default instance name set with set_default"
+    echo "  set_host_user             set/reset default username for host"
+    echo "    Username Name             set default host user with provided username name"
+    echo "    No Argument               remove the default username, use the current shell username"
+    echo "  get_host_user             get default username name set with set_host_user"
+    echo "  set_guest_user            set/reset default username for guest"
+    echo "    Username Name             set default guest user with provided username name"
+    echo "    No Argument               remove the default username, use the current shell username"
+    echo "  get_guest_user            get default username name set with set_guest_user"
+    echo ""
+    echo "Global options:"
+    echo "--------------"
+    echo "  list, -l                  lists current instances and saved mount points"
+    echo "    No Argument               lists current instances"
+    echo "    --mounts, -m              lists saved mount points for the instance"
+    echo ""
+    echo "Instance Settings:"
+    echo "-----------------"
+    echo "  mount, -m                 takes 2 arguments, <Host Path> <Guest Path>"
+    echo "                              Setting is saved for future and auto mounted next time instance is started"
+    echo "  umount, unmount, -um      takes 1 arguments, <Guest Path>"
+    echo "                              Mount Path is removed from auto mount list"
+    echo ""
+    echo "Instance operations:"
+    echo "-------------------"
+    echo "  start                     start the instance provided as argument"
+    echo "                              default machine if no argument"
+    echo "  stop                      stop the instance provided as argument"
+    echo "                              default machine if no argument"
+    echo "  restart                   restart the instance provided as argument"
+    echo "                              default machine if no argument"
+    echo "  shell                     login to the instance provided as argument"
+    echo "                              default machine if no argument"
+    echo "  exec, --                  execute command on guest and return"
+    echo ""
+    echo "Instance options:"
+    echo "----------------"
+    echo "  -hu, --host_user          argument as username to use for host os"
+    echo "                              default username set by 'set_host_user' if option not provided"
+    echo "                              current shell username used if no default user set by 'set_host_user'"
+    echo "  -gu, --guest_user         argument as username to use for guest os"
+    echo "                              default username set by 'set_guest_user' if option not provided"
+    echo "                              current shell username used if no default user set by 'set_guest_user'"
+}
+
+until [ -z $1 ]; do
+    case $1 in
+        -h | --help)
+            vm_help
+            exit
+            ;;
+        set_default)
+            shift
+            vm_set_default "$1"
+            exit
+            ;;
+        get_default)
+            VM_NAME=$(vm_get_default)
+            echo Default VM: $VM_NAME
+            exit
+            ;;
+        set_host_user)
+            shift
+            vm_set_host_user "$1" "$2"
+            exit
+            ;;
+        get_host_user)
+            shift
+            HOST_USER=$(vm_get_host_user "$1")
+            echo Host User: $HOST_USER
+            exit
+            ;;
+        set_guest_user)
+            shift
+            vm_set_guest_user "$1" "$2"
+            exit
+            ;;
+        get_guest_user)
+            shift
+            GUEST_USER=$(vm_get_guest_user "$1")
+            echo Guest User: $GUEST_USER
+            exit
+            ;;
+        start | stop | restart | reboot | shell)
+            set_operation $1
+            ;;
+        startup)
+            if [ "$2" == "enable" ]; then
+                echo true > $STARTUP_FILE
+            else
+                rm -f $STARTUP_FILE
+            fi
+            exit
+            ;;
+        --startup)
+            STARTUP=$(cat $STARTUP_FILE 2>/dev/null)
+            if [ "$STARTUP" == "true" ]; then
+                set_operation start
+            else
+                echo Startup is not set
+                exit
+            fi
+            ;;
+        -gu | --guest_user)
+            shift
+            if [ "$1" == "" ]; then
+                echo Need to provide username with -gu/--guest_user
+                exit
+            fi
+            GUEST_USER=$1
+            ;;
+        -hu | --host_user)
+            shift
+            if [ "$1" == "" ]; then
+                echo Need to provide username with -hu/--host_user
+                exit
+            fi
+            HOST_USER=$1
+            ;;
+        list | -l)
+            if [ "$2" == "--mounts" ] || [ "$2" == "-m" ]; then
+                shift
+                set_operation list_mounts
+            elif [ "$2" == "--long" ] || [ "$2" == "-v" ]; then
+                vm_list "--long"
+                exit
+            elif [ "$2" == "" ]; then
+                vm_list
+                exit
+            else
+                echo list/-l takes -v/--long and -m/--mounts as extra argument
+                exit
+            fi
+            ;;
+        exec | --)
+            check_required_params
+            shift
+            if [ "$1" == "" ]; then
+                echo exec option needs remote shell command
+                exit
+            fi
+            vm_exec "$@"
+            ;;
+        mount | -m)
+            check_required_params
+            shift
+            if [ "$1" == "--all" ] || [ "$1" == "-a" ]; then
+                vm_mount_all
+                exit
+            fi
+            if [ "$1" == "" ] || [ "$2" == "" ]; then
+                echo "mount needs 2 arguments(local/remote path), or all/-a for mount all"
+                exit
+            fi
+            vm_mount "$1" "$2"
+            exit
+            ;;
+        umount | unmount | -um)
+            check_required_params
+            shift
+            if [ "$1" == "--all" ] || [ "$1" == "-a" ]; then
+                vm_umount_all
+                exit
+            fi
+            if [ "$1" == "" ]; then
+                echo "umount needs 1 argument(local path), or all/-a for unmount all"
+                exit
+            fi
+            vm_umount "$1"
+            exit
+            ;;
+        *)
+            if [ -z $2 ] || [ "$2" == "exec" ] || [ "$2" == "--" ] || [ "$2" == "mount" ] || [ "$2" == "unmount" ] ; then
+                VM_NAME="$1"
+            else
+                echo unknown option $1. Virtual Machine name should be last argument.
+                exit
+            fi
+            ;;
+    esac
+    shift
+done
+
+debug_echo after switch VM_NAME: $VM_NAME
+
+check_required_params
+
+if [ "$OPERATION" == "start" ]; then
+    vm_start $VM_NAME
+elif [ "$OPERATION" == "stop" ]; then
+    vm_stop $VM_NAME
+elif [ "$OPERATION" == "restart" ] || [ "$OPERATION" == "reboot" ]; then
+    vm_stop $VM_NAME
+    vm_start $VM_NAME
+elif [ "$OPERATION" == "shell" ]; then
+    vm_shell $VM_NAME
+elif [ "$OPERATION" == "" ]; then
+    vm_shell $VM_NAME
+elif [ "$OPERATION" == "list_mounts" ]; then
+    vm_list_mounts $VM_NAME
+fi
